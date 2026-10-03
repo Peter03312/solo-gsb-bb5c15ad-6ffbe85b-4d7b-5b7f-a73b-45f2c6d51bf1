@@ -32,6 +32,13 @@ const {
   latestVisibleVersionNo,
   listRetractions,
 } = require('./retract');
+const {
+  openSession,
+  getSession,
+  listSessions,
+  appendSessionOps,
+  commitSession,
+} = require('./session');
 const scheduler = require('./scheduler');
 
 const router = express.Router();
@@ -561,6 +568,52 @@ router.get('/api/editor/routes/:no/raw', (req, res) => {
   const detail = getRouteDetail(no);
   if (!detail) throw { status: 404, message: `路线 ${req.params.no} 不存在` };
   res.json({ route: detail, versionRetracted: isRetracted(detail.versionNo) });
+});
+
+// ================= 并行编辑会话（暂存修改，提交时三方合并） =================
+// 两名编辑者同时整理草稿：各自开启会话（记录当时草稿修订号与事件/主张/关系快照），
+// 会话内修改先暂存为操作，提交时对照会话基线与当前草稿做三方合并。
+// 全部端点仅持编辑口令可用（/api/editor 已有口令中间件），访客不可见。
+
+// 开启会话：记录当前草稿修订号 + 事件/主张/「先于」关系快照（基线，只读）
+router.post('/api/editor/sessions', (req, res) => {
+  const body = req.body || {};
+  const session = openSession({
+    editor: optionalString(body, 'editor', 200) || '匿名编辑',
+    note: optionalString(body, 'note', 1000),
+  });
+  res.status(201).json({ ok: true, session });
+});
+
+// 会话列表（状态 / 基线修订号 / 操作数 / 结果摘要）
+router.get('/api/editor/sessions', (req, res) => {
+  res.json({ draftRevisionNo: draftRevisionNo(), sessions: listSessions() });
+});
+
+// 会话详情：基线快照、暂存操作、会话工作稿（基线+操作折叠）、提交结果
+router.get('/api/editor/sessions/:id', (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) throw badRequest('会话号必须是正整数');
+  const session = getSession(id);
+  if (!session) throw { status: 404, message: `编辑会话 ${req.params.id} 不存在` };
+  res.json({ session });
+});
+
+// 暂存一批操作：整批校验（沿用现有主张日期/出处/关系校验），有问题整批拒绝（422）
+router.post('/api/editor/sessions/:id/ops', (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) throw badRequest('会话号必须是正整数');
+  const result = appendSessionOps(id, req.body && req.body.ops);
+  res.status(201).json({ ok: true, ...result });
+});
+
+// 提交会话：三方合并。成功 200（新修订号 + 临时编号映射）；冲突 409 逐项列出
+// 基线/当前值/拟提交值；重复提交返回首次结果（幂等，不重复写入）。
+router.post('/api/editor/sessions/:id/commit', (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) throw badRequest('会话号必须是正整数');
+  const result = commitSession(id);
+  res.json({ ok: true, ...result });
 });
 
 module.exports = router;

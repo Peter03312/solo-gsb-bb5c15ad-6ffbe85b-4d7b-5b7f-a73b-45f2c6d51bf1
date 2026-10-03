@@ -82,6 +82,26 @@
     </div>
 
     <div class="card">
+      <h2>并行编辑会话（两人同时整理：暂存 → 三方合并提交）</h2>
+      <p class="muted">
+        两名编辑者并行整理草稿时，各自<b>开启编辑会话</b>：开启时记录当时的<b>草稿修订号</b>与事件 / 时间主张 /
+        「先于」关系快照（<b>基线，只读</b>；草稿不加锁，对方可继续编辑）。会话内的修改先<b>暂存</b>为一批操作
+        （不直接写草稿）；提交时对照<b>会话基线</b>与<b>当前草稿</b>做三方合并：彼此未触及的对象或字段<b>自动合并</b>；
+        同一字段被双方改成不同值、编辑与删除相撞、关系端点已删除时<b>整次拒绝</b>，逐项列出基线 / 当前值 / 拟提交值
+        供人工重编，<b>不覆盖另一人的改动</b>。成功提交原子应用全部变更并返回新草稿修订号与临时编号 → 正式编号映射；
+        重试同一提交不会重复写入；冲突后请<b>基于最新草稿重开会话</b>。会话内容仅持编辑口令者可见，访客不可见。
+      </p>
+      <div class="row">
+        <button id="btnSessionOpen" type="button">开启新会话（以当前草稿为基线）</button>
+        <button id="btnSessionRefresh" type="button" class="secondary">刷新会话列表</button>
+      </div>
+      <h3 style="margin-top:12px">会话列表</h3>
+      <div id="sessionList" class="muted">加载中…</div>
+      <div id="sessionDetail" style="margin-top:12px"></div>
+      <div id="sessionMsg" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
       <h2>按出处原文撤回公开展示（出处遮盖）</h2>
       <p class="muted">
         输入<b>非空的精确出处文本</b>（与快照中的出处逐字相同才命中），先<b>只读预览</b>它在

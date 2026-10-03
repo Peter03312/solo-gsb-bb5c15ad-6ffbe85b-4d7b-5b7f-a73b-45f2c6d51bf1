@@ -219,6 +219,40 @@ CREATE TABLE IF NOT EXISTS route_segments (
   relation_ids_json TEXT NOT NULL                  -- 链上关系 id 序列（该版快照 relation_id）
 );
 CREATE INDEX IF NOT EXISTS idx_route_segments_route ON route_segments(route_id);
+
+-- ============ 并行编辑会话（暂存修改，提交时三方合并） ============
+-- 两名编辑者同时整理草稿时各自开启会话：开启时把当时的草稿修订号与
+-- 全部事件 / 主张 / 「先于」关系快照存入 baseline_json（基线，只读不变）；
+-- 会话内的修改先写入 edit_session_ops 暂存（不直接改草稿，草稿也不加锁）。
+-- 提交时对照「基线」「当前草稿」「会话工作稿（基线+暂存操作）」做三方合并：
+-- 彼此未触及的对象 / 字段自动合并；同一字段被双方改成不同值、编辑与删除相撞、
+-- 关系端点已删除时整次拒绝（409），逐项列出基线 / 当前值 / 拟提交值。
+-- 成功提交在一个事务内应用全部变更（草稿修订号只推进一次），返回新修订号与
+-- 临时编号 → 正式编号映射；会话随即关闭（committed / conflicted 均为终态），
+-- 重复提交返回首次结果、绝不重复写入；冲突后须基于最新草稿重开会话。
+-- 会话内容只在 /api/editor 下暴露（持编辑口令），访客不可见。
+CREATE TABLE IF NOT EXISTS edit_sessions (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,   -- 会话号
+  editor           TEXT NOT NULL DEFAULT '',
+  note             TEXT NOT NULL DEFAULT '',
+  base_revision_no INTEGER NOT NULL,                    -- 开启时的草稿修订号
+  baseline_json    TEXT NOT NULL,                       -- 开启时的草稿快照（事件/主张/关系）
+  status           TEXT NOT NULL DEFAULT 'open'
+                     CHECK (status IN ('open','committed','conflicted')),
+  result_json      TEXT,                                -- committed: {revisionNo,idMap,applied,autoMerged}；conflicted: {conflicts,currentRevisionNo}
+  created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+  closed_at        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS edit_session_ops (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER NOT NULL REFERENCES edit_sessions(id) ON DELETE CASCADE,
+  seq        INTEGER NOT NULL,                          -- 会话内操作序号（从 1 开始）
+  op_json    TEXT NOT NULL,                             -- 暂存的操作（暂存前已校验）
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (session_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_session_ops_session ON edit_session_ops(session_id);
 `;
 
 let db;
