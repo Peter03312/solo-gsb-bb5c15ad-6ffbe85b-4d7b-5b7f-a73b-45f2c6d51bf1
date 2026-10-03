@@ -25,6 +25,14 @@ const {
   listRoutes,
 } = require('./route');
 const {
+  openSession,
+  getSession,
+  listSessions,
+  stageChanges,
+  commitSession,
+  abandonSession,
+} = require('./session');
+const {
   retractVersion,
   getRetraction,
   isRetracted,
@@ -561,6 +569,63 @@ router.get('/api/editor/routes/:no/raw', (req, res) => {
   const detail = getRouteDetail(no);
   if (!detail) throw { status: 404, message: `路线 ${req.params.no} 不存在` };
   res.json({ route: detail, versionRetracted: isRetracted(detail.versionNo) });
+});
+
+// ---- 并行整理：只读编辑会话（暂存修改，提交时三方合并） ----
+// 会话内容（基线草稿 / 暂存 / 冲突明细）只经本编辑者接口暴露；公开接口完全不可见。
+
+// 开启会话：冻结当时草稿（事件/主张/先于关系）与草稿修订号，不写草稿
+router.post('/api/editor/sessions', (req, res) => {
+  const body = req.body || {};
+  const editor = optionalString(body, 'editor', 200) || '匿名编辑';
+  const note = optionalString(body, 'note', 1000);
+  const session = openSession({ editor, note });
+  res.status(201).json({ ok: true, session });
+});
+
+// 会话列表（编辑者工作台；只含摘要，不含完整基线/暂存）
+router.get('/api/editor/sessions', (req, res) => {
+  res.json({ currentRevisionNo: draftRevisionNo(), sessions: listSessions() });
+});
+
+// 会话详情：基线快照 + 暂存修改 + 派生工作副本（只读，不触碰草稿）
+router.get('/api/editor/sessions/:no', (req, res) => {
+  const no = Number(req.params.no);
+  if (!Number.isInteger(no) || no < 1) throw badRequest('会话号必须是正整数');
+  const session = getSession(no);
+  if (!session) throw { status: 404, message: `编辑会话 ${req.params.no} 不存在` };
+  res.json({ session });
+});
+
+// 暂存整组修改（替换式：会话内修改只进暂存，草稿在提交前不变）
+router.put('/api/editor/sessions/:no/changes', (req, res) => {
+  const no = Number(req.params.no);
+  if (!Number.isInteger(no) || no < 1) throw badRequest('会话号必须是正整数');
+  const body = req.body || {};
+  if (!body.changes) throw badRequest('请求体必须含 changes 分组（events/claims/relations 各含 create/update/delete）');
+  const session = stageChanges(no, body.changes);
+  res.json({ ok: true, session });
+});
+
+// 提交：三方合并 + 原子应用。409 时逐项给出 baseline/current/proposed，会话只读，
+// 须基于最新草稿重开会话；同一会话（或同 commitKey）重试不重复写入。
+router.post('/api/editor/sessions/:no/commit', (req, res) => {
+  const no = Number(req.params.no);
+  if (!Number.isInteger(no) || no < 1) throw badRequest('会话号必须是正整数');
+  const body = req.body || {};
+  const commitKey = body.commitKey === undefined || body.commitKey === null ? undefined : body.commitKey;
+  if (commitKey !== undefined && typeof commitKey !== 'string') throw badRequest('commitKey 必须是字符串');
+  const result = commitSession(no, { commitKey });
+  // 首次提交 201；同一会话重试为幂等重放（不再写入）→ 200
+  res.status(result.replayed ? 200 : 201).json({ ok: true, ...result });
+});
+
+// 放弃尚未提交的会话（重复放弃幂等；已提交/冲突会话不能放弃 → 409）
+router.delete('/api/editor/sessions/:no', (req, res) => {
+  const no = Number(req.params.no);
+  if (!Number.isInteger(no) || no < 1) throw badRequest('会话号必须是正整数');
+  const result = abandonSession(no);
+  res.json({ ok: true, ...result });
 });
 
 module.exports = router;

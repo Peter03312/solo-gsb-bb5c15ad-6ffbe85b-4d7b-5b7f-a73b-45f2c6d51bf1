@@ -357,6 +357,83 @@ curl -s -H "X-Editor-Token: $TOKEN" \
 
 完整可运行的端到端示例见 `examples/route-example.sh`（建草稿发布、三锚点路线、关系 ID 择小、遮盖联动、改草稿发新版验证路线不变、各类 400/404/422）。
 
+### 两名编辑者并行整理（只读编辑会话：暂存 → 三方合并提交）
+
+两位编辑者并行整理年表草稿时，可在工作台「并行整理：只读编辑会话」卡片**开启只读编辑会话**，或直接调用 HTTP API。会话机制：
+
+1. **开会话即冻结基线**：建立时记录当时的**草稿修订号**与事件、主张、「先于」关系完整快照（`baseline`）。会话期间正式草稿不被触碰。
+2. **会话内修改只暂存**：所有增 / 删 / 改以一组 changeset（`events / claims / relations` 各自含 `create / update / delete`）整组暂存在会话里；新建对象使用**临时编号**（非空字符串 `tempId`，如 `"T"`、`"CT"`），主张与关系可用临时编号引用本会话新建的事件。每次暂存都做结构（400）与语义（422 一次性列出）校验：沿用现有**日期、出处、自环**校验，另查未知正式编号、临时编号重复 / 悬空、同一对象既改又删等；不通过则整组不保存。会话详情返回由「基线 + 暂存」派生的**工作副本** `working`（只读展示，不写草稿）。
+3. **提交时三方合并**：对照**会话基线 baseline / 当前草稿 current / 拟提交值 proposed**：
+   - 双方都没碰、或只有一方改动（含双方改成相同值）的对象或字段**自动合并**；一方删除、另一方未触碰的对象也自动合并（含随事件级联删除的主张 / 关系）；
+   - **同一字段被双方改成不同值、编辑与删除相撞（含删除会销毁对方新增的主张 / 关系）、拟改或拟建「先于」关系的端点事件已删除、拟建主张的事件已删除** → **整次拒绝**：草稿一字不写，逐项列出每项的 `baseline / current / proposed` 供人工重编，会话置 `conflict`（只读），**不覆盖另一人的改动**。
+4. **原子提交与编号映射**：无冲突时在**一个事务**内应用全部增删改，整次提交只推进**一次**草稿修订号，响应返回新草稿修订号与**临时编号 → 正式编号映射**（`idMap.events / claims / relations`）。
+5. **重试不重复写入**：对同一会话的重复提交是**幂等重放**——首次 201、重试 200 且 `replayed:true`，返回首次结果，绝不重复落库（也可带客户端 `commitKey`，同会话内重试携带同键）。
+6. **冲突后重开**：`conflict` 会话不能再暂存或提交（409 `SESSION_NOT_OPEN`），须基于最新草稿**开启新会话**人工重编。尚未提交的 `open` 会话可放弃（重复放弃幂等；已提交 / 冲突会话不能放弃）。
+7. **权限**：会话内容（基线草稿、暂存、冲突明细）**只供持编辑口令者**读取与操作，全部走 `/api/editor/sessions*`，访客公开接口完全不可见。
+8. **既有规则不变**：会话只负责草稿合并；提交后的草稿仍须逐事件选定主张并通过现有**发布校验**（日期精度区间、出处、先于关系求解），**发布与预约的 `baseVersionNo` 版本冲突规则**、出处遮盖、撤回、预约冻结等均保持原样。
+
+工作台用法：点「开启只读编辑会话」→ 在弹窗的工作副本里**暂存**事件 / 主张 / 关系的增删改（正式对象显示正式编号、新建对象显示临时标记）→ 点「原子提交暂存」。无冲突时提示新修订号与编号映射；冲突时弹窗逐项展示三方数值，关闭后「开启只读编辑会话」基于最新草稿重开即可。会话列表标注每个会话的状态（暂存中 / 已提交 / 冲突待重编 / 已放弃）、基线与当前修订号（`open` 会话若基线已过期会高亮提示提交时三方合并）。
+
+```bash
+TOKEN=editor
+BASE=http://localhost:3000
+
+# 1) 开启只读会话：冻结草稿修订号与事件/主张/关系
+curl -s -X POST "$BASE/api/editor/sessions" \
+  -H "Content-Type: application/json" -H "X-Editor-Token: $TOKEN" \
+  -d '{"editor":"志愿者甲","note":"并行整理冬修部分"}'
+# => 201 {"ok":true,"session":{"sessionNo":1,"status":"open",
+#        "baselineRevisionNo":7,"currentRevisionNo":7,"stale":false,
+#        "baseline":{"events":[...],"relations":[...],"counts":{...}},
+#        "changes":{events/claims/relations 各 create/update/delete},
+#        "working":{...基线+暂存的工作副本...}}}
+
+# 2) 整组暂存修改（替换式；临时编号用于新建对象与引用）
+curl -s -X PUT "$BASE/api/editor/sessions/1/changes" \
+  -H "Content-Type: application/json" -H "X-Editor-Token: $TOKEN" \
+  -d '{"changes":{
+    "events":{
+      "create":[{"tempId":"T","title":"水闸落成","description":"新建事件"}],
+      "update":[{"id":1,"title":"动员会（改）"}],
+      "delete":[]},
+    "claims":{
+      "create":[{"tempId":"CT","eventId":"T","precision":"day","year":1959,"month":6,"day":1,"source":"水利志第12页"}],
+      "update":[{"id":3,"note":"补充考异"}],
+      "delete":[7]},
+    "relations":{
+      "create":[{"tempId":"RT","earlierId":"T","laterId":2,"source":"志书载明"}],
+      "update":[],
+      "delete":[9]}}}'
+# 语义问题（坏日期/缺出处/自环/引用已删事件/既改又删…）→ 422
+# {"code":"SESSION_CHANGESET_INVALID","problems":[{"type","message",...}]}，整组不保存
+
+# 3) 原子提交：成功 201，返回新修订号与临时→正式编号映射
+curl -s -X POST "$BASE/api/editor/sessions/1/commit" \
+  -H "Content-Type: application/json" -H "X-Editor-Token: $TOKEN" \
+  -d '{"commitKey":"可选客户端幂等键"}'
+# => 201 {"ok":true,"replayed":false,"sessionNo":1,"revisionNo":8,
+#        "baselineRevisionNo":7,"merged":true,
+#        "idMap":{"events":[{"tempId":"T","eventId":12}],
+#                 "claims":[{"tempId":"CT","claimId":18,"eventId":12,"eventTempId":"T"}],
+#                 "relations":[{"tempId":"RT","relationId":11,"earlierId":12,"laterId":2,"earlierTempId":"T"}]}}
+# 冲突 → 409（草稿未改动，会话置 conflict）：
+# {"code":"SESSION_MERGE_CONFLICT","baselineRevisionNo":7,"currentRevisionNo":9,
+#  "conflicts":[{"type":"field_conflict","entity":"event","id":1,"field":"title",
+#                "baseline":"动员会","current":"乙定标题","proposed":"甲定标题",
+#                "message":"…请人工重编"}, ...]}
+
+# 4) 重试同一提交 → 200 replayed（不重复写入）
+curl -s -X POST "$BASE/api/editor/sessions/1/commit" -H "X-Editor-Token: $TOKEN" -d '{}'
+
+# 会话列表（摘要）/ 详情（基线+暂存+工作副本+冲突/结果）
+curl -s -H "X-Editor-Token: $TOKEN" "$BASE/api/editor/sessions"
+curl -s -H "X-Editor-Token: $TOKEN" "$BASE/api/editor/sessions/1"
+# 放弃尚未提交的会话（重复放弃幂等）
+curl -s -X DELETE -H "X-Editor-Token: $TOKEN" "$BASE/api/editor/sessions/1"
+```
+
+完整可运行的端到端示例见 `examples/session-example.sh`（口令 401、暂存不写草稿、互不触碰自动合并、重试幂等、同字段冲突 / 编辑删除相撞 / 端点删除逐项拒绝、冲突后重开会话重编、422/400/409 边界，约 3 秒）。
+
 ### 两名编辑者并发修改（版本冲突）
 
 发布请求必须带 `baseVersionNo`（编辑台打开时自动记录当前最新版本号）。若两名编辑者都从第 N 版开始改，第一人发布产生第 N+1 版后，第二人仍以 `baseVersionNo=N` 提交时：
@@ -383,6 +460,7 @@ curl -s -H "X-Editor-Token: $TOKEN" \
 - 版本撤回表 `version_retractions` 只追加审计记录：版本号（UNIQUE，每版至多一条）、非空原因、编辑者、时间；**不回写快照或草稿**，访客读出层据此隐藏撤回版，编辑者接口不受影响。
 - 预约发布表 `publish_schedules` 在建立时冻结完整待发布内容（事件 / 所选主张 / 关系 / 求解日期）与基准版本号；`status` 在待执行（`pending`）、已发布（`published`）、冲突（`conflict`）、已取消（`cancelled`）间单向流转。到期写版本与翻状态在同一事务内完成，重启只补跑 `pending` 行；**冻结基准版已被撤回的预约到期转冲突，不生成新版本**。
 - 脉络路线表 `routes / route_anchors / route_segments` 同样只追加：建立时冻结所据版本号、锚点顺序与每段见证链（事件 id 序列与关系 id 序列），展示字段读自该版不可变快照，因此改草稿、恢复草稿、发新版都不影响旧路线。
+- 并行编辑会话表 `edit_sessions` 保存每个只读会话的冻结基线（`baseline_json`）、整组暂存（`changes_json`，新建对象用临时编号）、基线草稿修订号与单向状态（`open` → `committed` / `conflict` / `abandoned`）。**该表不是草稿区表**：对它的读写都不触发草稿修订号自增；成功提交在单事务内应用全部变更并把修订号校正为「提交前 + 1」。冲突会话保留逐项 `baseline / current / proposed` 供人工重编，`commit_key` 与终态保证同会话重试不重复写入；会话内容只经编辑者接口暴露，访客不可见。
 
 ## 目录结构
 
@@ -401,10 +479,11 @@ src/
   schedule.js   预约发布：建立时冻结快照/基准版本号；到期按时间、预约号顺序逐条事务执行（发布或标冲突，幂等不重发不留半版；基准版已撤回 → 冲突）；查看/取消
   scheduler.js  预约调度器：每秒检查到期预约，服务启动立即补跑（重启安全）
   route.js      专题脉络路线：锚点校验 + 分层 BFS 求最少关系见证链（同长度按关系 ID 序列择小）+ 冻结落库；公开读出层动态遮盖出处
+  session.js    并行只读编辑会话：冻结基线 + 整组暂存（日期/出处/自环/引用语义校验）+ 三方合并规划（字段冲突/编辑删除相撞/端点删除逐项收集）+ 单事务原子应用（修订号只推进一次，临时编号→正式编号映射，重试幂等）
   seed.js       演示数据
 public/         访客页与编辑台（原生 HTML/CSS/JS）
-examples/       采访整理包 JSON 示例；出处遮盖、预约发布、脉络路线、版本撤回 curl 调用示例
-test/           node:test 单元与端到端测试（含成环、无解、409 冲突、草稿恢复、整理包导入、出处遮盖、预约发布/重启补跑、脉络路线、版本撤回）
+examples/       采访整理包 JSON 示例；并行编辑会话、出处遮盖、预约发布、脉络路线、版本撤回 curl 调用示例
+test/           node:test 单元与端到端测试（含成环、无解、409 冲突、草稿恢复、整理包导入、出处遮盖、预约发布/重启补跑、脉络路线、版本撤回、并行会话三方合并/幂等/冲突）
 ```
 
 ## 主要 HTTP API
@@ -418,6 +497,15 @@ test/           node:test 单元与端到端测试（含成环、无解、409 �
 编辑（需请求头 `X-Editor-Token`）：
 
 - `GET  /api/editor/state` — 草稿全貌 + 当前版本号（最高已发布版本号，含撤回版）+ 访客可见最新版号 `latestVisibleVersionNo` + 草稿修订号 `draftRevisionNo`
+- 并行编辑会话（详见上文「两名编辑者并行整理」；会话内容仅持编辑口令可见）：
+  - `POST /api/editor/sessions` — 开启只读会话，冻结当时草稿与修订号；201 `{session:{sessionNo,status:"open",baselineRevisionNo,currentRevisionNo,stale,baseline,changes,working,...}}`
+  - `GET  /api/editor/sessions` / `GET /api/editor/sessions/:no` — 会话摘要列表（含状态、基线/当前修订号、暂存计数、冲突数）/ 会话详情（完整基线、暂存、工作副本、冲突明细或提交结果）；不存在 404
+  - `PUT  /api/editor/sessions/:no/changes` — 整组替换暂存 `{changes:{events,claims,relations 各 {create,update,delete}}}`；新建对象用 `tempId`，主张/关系可用临时编号引用新事件
+    - 200：`{session}`（工作副本随之更新，草稿不变）；结构错误 400；日期/出处/自环/未知编号/引用已删事件/既改又删等语义问题 422 `{code:"SESSION_CHANGESET_INVALID",problems:[{type,message,...}]}`（整组不保存，会话仍 open）；非 open 会话 409 `SESSION_NOT_OPEN`
+  - `POST /api/editor/sessions/:no/commit` — 三方合并 + 单事务原子应用；体含可选 `commitKey`
+    - 201：`{revisionNo,baselineRevisionNo,merged,idMap:{events:[{tempId,eventId}],claims:[{tempId,claimId,eventId,eventTempId?}],relations:[{tempId,relationId,earlierId,laterId,...}]}}`；重试同会话 200 且 `replayed:true`（不重复写入）
+    - 409：`{code:"SESSION_MERGE_CONFLICT",baselineRevisionNo,currentRevisionNo,conflicts:[{type,entity,id,tempId?,field?,baseline,current,proposed,message}]}`（整次拒绝、草稿未改、会话置 conflict 只读）；空暂存 400；已放弃 409
+  - `DELETE /api/editor/sessions/:no` — 放弃 open 会话（200 `{abandoned:true}`；重复放弃幂等 200 `alreadyAbandoned:true`）；已提交/冲突 409 `SESSION_NOT_ABANDONABLE`；不存在 404
 - 事件：`POST /api/editor/events`、`PUT/DELETE /api/editor/events/:id`
 - 主张：`POST /api/editor/events/:id/claims`、`PUT/DELETE /api/editor/claims/:claimId`
 - 关系：`POST /api/editor/relations`、`DELETE /api/editor/relations/:id`

@@ -219,6 +219,34 @@ CREATE TABLE IF NOT EXISTS route_segments (
   relation_ids_json TEXT NOT NULL                  -- 链上关系 id 序列（该版快照 relation_id）
 );
 CREATE INDEX IF NOT EXISTS idx_route_segments_route ON route_segments(route_id);
+
+-- ============ 并行整理：只读编辑会话（暂存 + 三方合并提交） ============
+-- 开启会话时把当时草稿（事件 / 主张 / 先于关系）与草稿修订号整体冻结进
+-- baseline_json；会话内的修改只写入 changes_json（暂存），不触碰草稿区。
+-- 提交时以「会话基线 vs 当前草稿 vs 拟提交值」做三方合并：
+--   - 双方都没碰、或只有一方改动的对象/字段自动合并；
+--   - 同一字段被双方改成不同值、编辑与删除相撞、关系端点已删除 → 整次拒绝（409），
+--     逐项列出 baseline/current/proposed，会话置 conflict（只读），须基于最新草稿重开；
+--   - 成功提交在一个事务内原子应用全部变更，草稿修订号只推进一次，
+--     返回新修订号与临时编号 → 正式编号映射；commit_key 保证重试不重复写入。
+-- 本表不是草稿区表：对它的写操作不会触发 draft_meta 修订号自增。
+CREATE TABLE IF NOT EXISTS edit_sessions (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,   -- 会话号
+  editor           TEXT NOT NULL DEFAULT '',
+  note             TEXT NOT NULL DEFAULT '',
+  status           TEXT NOT NULL DEFAULT 'open'
+                     CHECK (status IN ('open','committed','conflict','abandoned')),
+  baseline_revision INTEGER NOT NULL,                   -- 开会话时的草稿修订号
+  baseline_json    TEXT NOT NULL,                       -- 冻结：{events,relations,counts}
+  changes_json     TEXT NOT NULL,                       -- 暂存：{events:{create,update,delete},claims:{...},relations:{...}}
+  commit_key       TEXT,                                -- 提交幂等键（首次提交时确定，重试同键不重复写入）
+  conflicts_json   TEXT,                                -- conflict：逐项冲突（baseline/current/proposed）
+  result_json      TEXT,                                -- committed：提交结果（新修订号与临时→正式编号映射）
+  committed_at     TEXT,
+  abandoned_at     TEXT,
+  created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_edit_sessions_status ON edit_sessions(status);
 `;
 
 let db;

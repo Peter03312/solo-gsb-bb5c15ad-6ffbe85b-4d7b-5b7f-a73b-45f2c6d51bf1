@@ -203,6 +203,7 @@ async function loadState() {
   loadVersions();
   loadSchedules();
   loadRoutes();
+  loadSessions();
 }
 
 async function loadVersions() {
@@ -1287,8 +1288,444 @@ function onChange(e) {
   }
 }
 
+// ---------- 并行整理：只读编辑会话（暂存 + 三方合并提交） ----------
+let sessions = [];            // 会话摘要列表
+let openSessionData = null;   // 当前打开的会话详情（含 baseline/changes/working）
+let sessionCommitKey = null;  // 本次提交的幂等键（网络重试不重复写入）
+
+const SESSION_STATUS_LABEL = { open: '暂存中', committed: '已提交', conflict: '冲突待重编', abandoned: '已放弃' };
+
+function showSessionMsg(kind, html) {
+  const el = document.querySelector('#sessionMsg');
+  if (el) el.innerHTML = `<div class="alert ${kind}">${html}</div>`;
+}
+
+async function loadSessions() {
+  try {
+    const data = await api('GET', '/api/editor/sessions');
+    sessions = data.sessions || [];
+    renderSessionList(data.currentRevisionNo);
+  } catch (err) {
+    if (err.message !== 'unauthorized') {
+      document.querySelector('#sessionList').innerHTML =
+        `<span class="muted">${esc(err.message)}</span>`;
+    }
+  }
+}
+
+function renderSessionList(currentRevisionNo) {
+  const el = document.querySelector('#sessionList');
+  if (!sessions.length) {
+    el.innerHTML = '<p class="muted">尚无编辑会话。</p>';
+    return;
+  }
+  el.innerHTML = sessions.map((s) => {
+    const badge = s.status === 'conflict'
+      ? '<span class="badge" style="background:#fbeaea;color:#a33">冲突待重编</span>'
+      : s.status === 'committed'
+        ? '<span class="badge" style="background:#e8f4ec;color:#2a7a44">已提交</span>'
+        : s.status === 'abandoned'
+          ? '<span class="badge">已放弃</span>'
+          : '<span class="badge prec">暂存中</span>';
+    const stale = s.status === 'open' && s.stale
+      ? '<span class="badge" style="background:#fff4e0;color:#a15c00">基线已过期（他人改过草稿，提交时三方合并）</span>'
+      : '';
+    const c = s.stagedCounts;
+    const staged = c.eventCreate + c.eventUpdate + c.eventDelete + c.claimCreate + c.claimUpdate +
+      c.claimDelete + c.relationCreate + c.relationUpdate + c.relationDelete;
+    return `
+      <div class="rel-line">
+        <div class="row" style="align-items:center">
+          <strong>会话 #${s.sessionNo}</strong>
+          ${badge}${stale}
+          <span class="muted" style="flex:1">
+            ${esc(s.editor || '匿名')} · 基线修订号 ${s.baselineRevisionNo}（当前 ${s.currentRevisionNo}）
+            · 暂存 ${staged} 项 · 建立于 ${esc(s.createdAt)} UTC
+          </span>
+          <button class="secondary" type="button" data-open-session="${s.sessionNo}" style="padding:2px 10px;font-size:13px">
+            ${s.status === 'conflict' ? '查看冲突并重编' : '打开 / 继续'}
+          </button>
+        </div>
+        ${s.conflictCount ? `<div class="muted" style="color:#a33">${s.conflictCount} 处合并冲突：整次提交已被拒绝，草稿未改动；请基于最新草稿重开会话。</div>` : ''}
+        ${s.result ? `<div class="muted">已提交：新草稿修订号 ${s.result.revisionNo}${s.result.merged ? '（已与他人改动自动合并）' : ''}。</div>` : ''}
+      </div>`;
+  }).join('');
+}
+
+async function createSessionFromUi() {
+  const editor = store.editor || '匿名编辑';
+  try {
+    const data = await api('POST', '/api/editor/sessions', { editor, note: '' });
+    showGlobal('ok', `已开启<b>只读编辑会话 #${data.session.sessionNo}</b>：基线草稿修订号 ${data.session.baselineRevisionNo}，修改只暂存，不影响草稿。`);
+    await loadSessions();
+    openSessionDialog(data.session.sessionNo);
+  } catch (err) {
+    if (err.message !== 'unauthorized') showGlobal('error', esc(err.message));
+  }
+}
+
+async function openSessionDialog(no) {
+  document.querySelector('#sessionDetailNo').textContent = '#' + no;
+  document.querySelector('#sessionBody').textContent = '加载会话中…（只读基线，不修改草稿）';
+  document.querySelector('#sessionDialog').showModal();
+  sessionCommitKey = null;
+  openSessionData = null;
+  try {
+    const data = await api('GET', `/api/editor/sessions/${no}`);
+    openSessionData = data.session;
+    renderSessionDialog();
+  } catch (err) {
+    if (err.message === 'unauthorized') { document.querySelector('#sessionDialog').close(); return; }
+    document.querySelector('#sessionBody').innerHTML = `<div class="alert error">${esc(err.message)}</div>`;
+  }
+}
+
+// ---- 暂存变更的本地增删改（直接操作 openSessionData.changes，再整组 PUT） ----
+function scChanges() { return openSessionData.changes; }
+function genTempId(prefix) {
+  const c = scChanges();
+  let n = 1;
+  const used = new Set([
+    ...c.events.create.map((e) => e.tempId),
+    ...c.claims.create.map((x) => x.tempId),
+    ...c.relations.create.map((x) => x.tempId),
+  ]);
+  while (used.has(`${prefix}${n}`)) n += 1;
+  return `${prefix}${n}`;
+}
+
+function sessionAddEvent() {
+  const title = window.prompt('新事件标题（仅暂存，提交后才正式写入草稿）：');
+  if (title === null) return;
+  if (!title.trim()) { showSessionMsg('error', '事件标题不能为空。'); return; }
+  scChanges().events.create.push({ tempId: genTempId('e'), title: title.trim(), description: '' });
+  persistSession('已暂存新事件（临时编号，提交后映射正式编号）。');
+}
+
+function sessionDeleteEvent(ref) {
+  const c = scChanges();
+  if (typeof ref === 'number') {
+    if (!confirm(`暂存删除正式事件 #${ref}？其主张与先于关系会一并暂存删除，提交后才生效。`)) return;
+    c.events.delete.push(ref);
+    // 连带暂存删除其基线主张 / 关系（整组语义要求：随事件删除不单列）
+    const base = openSessionData.baseline;
+    const ev = base.events.find((e) => e.id === ref);
+    if (ev) ev.claims.forEach((cl) => c.claims.delete.push(cl.id));
+    base.relations.forEach((r) => {
+      if (r.earlierId === ref || r.laterId === ref) c.relations.delete.push(r.id);
+    });
+  } else {
+    if (!confirm(`移除暂存的新事件「${ref}」？`)) return;
+    c.events.create = c.events.create.filter((e) => e.tempId !== ref);
+    c.claims.create = c.claims.create.filter((x) => x.eventId !== ref);
+    c.relations.create = c.relations.create.filter((r) => r.earlierId !== ref && r.laterId !== ref);
+  }
+  persistSession('已暂存事件删除。');
+}
+
+function sessionSaveEventField(ref) {
+  const titleEl = document.querySelector(`[data-sev-title="${CSS.escape(String(ref))}"]`);
+  const descEl = document.querySelector(`[data-sev-desc="${CSS.escape(String(ref))}"]`);
+  const title = titleEl.value.trim();
+  if (!title) { showSessionMsg('error', '事件标题不能为空。'); return; }
+  const c = scChanges();
+  if (typeof ref === 'number') {
+    let patch = c.events.update.find((p) => p.id === ref);
+    if (!patch) { patch = { id: ref }; c.events.update.push(patch); }
+    patch.title = title;
+    patch.description = descEl.value;
+  } else {
+    const ev = c.events.create.find((e) => e.tempId === ref);
+    ev.title = title; ev.description = descEl.value;
+  }
+  persistSession('已暂存事件修改。');
+}
+
+function sessionAddClaim(eventRef) {
+  const precision = window.prompt('主张精度：year / month / day', 'year');
+  if (!['year', 'month', 'day'].includes(precision)) { showSessionMsg('error', '精度必须是 year、month 或 day。'); return; }
+  const year = Number(window.prompt('年份（如 1958）：'));
+  let month; let day;
+  if (precision === 'month' || precision === 'day') month = Number(window.prompt('月份（1-12）：'));
+  if (precision === 'day') day = Number(window.prompt('日（1-31）：'));
+  const source = window.prompt('出处（受访人 / 档案 / 页码，必填）：');
+  if (!source || !source.trim()) { showSessionMsg('error', '出处必填。'); return; }
+  const item = { tempId: genTempId('c'), eventId: eventRef, precision, year, source: source.trim(), note: '' };
+  if (month !== undefined) item.month = month;
+  if (day !== undefined) item.day = day;
+  scChanges().claims.create.push(item);
+  persistSession('已暂存新主张。');
+}
+
+function sessionDeleteClaim(ref) {
+  const c = scChanges();
+  if (typeof ref === 'number') {
+    if (!confirm('暂存删除这条主张？提交后才生效。')) return;
+    c.claims.delete.push(ref);
+  } else {
+    c.claims.create = c.claims.create.filter((x) => x.tempId !== ref);
+  }
+  persistSession('已暂存主张删除。');
+}
+
+function sessionEditClaim(ref) {
+  const source = window.prompt('修改出处（留空取消；只改出处，不改日期）：');
+  if (source === null) return;
+  if (!source.trim()) { showSessionMsg('error', '出处不能为空。'); return; }
+  const c = scChanges();
+  if (typeof ref === 'number') {
+    let patch = c.claims.update.find((p) => p.id === ref);
+    if (!patch) { patch = { id: ref }; c.claims.update.push(patch); }
+    patch.source = source.trim();
+  } else {
+    const item = c.claims.create.find((x) => x.tempId === ref);
+    item.source = source.trim();
+  }
+  persistSession('已暂存主张出处修改。');
+}
+
+function sessionAddRelation() {
+  const w = openSessionData.working;
+  const refs = w.events.map((e) => (e.tempId ? `临时「${e.tempId}」(${e.title})` : `#${e.id}(${e.title})`));
+  const earlier = window.prompt(`较早事件引用（正式编号数字或临时编号字符串）。可选项：\n${refs.join('\n')}`);
+  if (earlier === null) return;
+  const later = window.prompt(`较晚事件引用（同上）：\n${refs.join('\n')}`);
+  if (later === null) return;
+  const earlierRef = Number(earlier);
+  const laterRef = Number(later);
+  const item = {
+    tempId: genTempId('r'),
+    earlierId: Number.isFinite(earlierRef) && String(earlierRef) === earlier.trim() ? earlierRef : earlier.trim(),
+    laterId: Number.isFinite(laterRef) && String(laterRef) === later.trim() ? laterRef : later.trim(),
+    source: '', note: '',
+  };
+  scChanges().relations.create.push(item);
+  persistSession('已暂存新先于关系（端点在提交时解析）。');
+}
+
+function sessionDeleteRelation(ref) {
+  const c = scChanges();
+  if (typeof ref === 'number') {
+    if (!confirm('暂存删除这条先于关系？提交后才生效。')) return;
+    c.relations.delete.push(ref);
+  } else {
+    c.relations.create = c.relations.create.filter((x) => x.tempId !== ref);
+  }
+  persistSession('已暂存关系删除。');
+}
+
+async function persistSession(okText) {
+  try {
+    const data = await api('PUT', `/api/editor/sessions/${openSessionData.sessionNo}/changes`, { changes: scChanges() });
+    openSessionData = data.session;
+    renderSessionDialog();
+    showSessionMsg('ok', esc(okText) + ' 草稿在提交前保持不变。');
+  } catch (err) {
+    if (err.message === 'unauthorized') return;
+    if (err.status === 422 && err.body && Array.isArray(err.body.problems)) {
+      const items = err.body.problems.map((p) => `<li>${esc(p.message)}</li>`).join('');
+      showSessionMsg('error', `<b>${esc(err.body.message)}</b><ul class="error-list">${items}</ul>`);
+    } else if (err.status === 409) {
+      showSessionMsg('error', esc(err.message));
+    } else {
+      showSessionMsg('error', esc(err.message));
+    }
+  }
+}
+
+function sessionEventTitle(ref) {
+  const ev = openSessionData.working.events.find((e) => e.id === ref || e.tempId === ref);
+  return ev ? ev.title : (typeof ref === 'string' ? `临时「${ref}」` : `#${ref}`);
+}
+
+function renderSessionDialog() {
+  const s = openSessionData;
+  const readOnly = s.status !== 'open';
+  const badge = document.querySelector('#sessionStatusBadge');
+  badge.textContent = SESSION_STATUS_LABEL[s.status] || s.status;
+  badge.style.background = s.status === 'conflict' ? '#fbeaea' : s.status === 'committed' ? '#e8f4ec' : '#eef4fb';
+  badge.style.color = s.status === 'conflict' ? '#a33' : s.status === 'committed' ? '#2a7a44' : '#245b96';
+
+  document.querySelector('#sessionCommit').style.display = readOnly ? 'none' : '';
+  document.querySelector('#sessionAbandon').style.display = s.status === 'open' ? '' : 'none';
+
+  const w = s.working;
+  const eventCards = w.events.map((ev) => {
+    const ref = ev.tempId || ev.id;
+    const claims = ev.claims.map((c) => {
+      const cref = c.tempId || c.id;
+      const tag = c.tempId ? '<span class="badge" style="background:#eef4fb;color:#245b96">临时</span>' : '';
+      return `
+        <div class="claim" style="margin:4px 0">
+          <div class="row">
+            <div style="flex:1">
+              ${tag} <strong>${esc(c.dateLabel)}</strong>
+              <span class="badge">${esc(c.intervalStart)} ~ ${esc(c.intervalEnd)}</span>
+              <div class="source"><b>出处：</b>${esc(c.source || '（未注明）')}</div>
+            </div>
+            ${readOnly ? '' : `
+              <div style="flex:0 0 auto">
+                <button class="secondary" type="button" data-se-edit-claim="${esc(String(cref))}" style="padding:2px 8px;font-size:12px">改出处</button>
+                <button class="danger" type="button" data-se-del-claim="${esc(String(cref))}" style="padding:2px 8px;font-size:12px">暂存删除</button>
+              </div>`}
+          </div>
+        </div>`;
+    }).join('') || '<p class="muted" style="margin:4px 0">暂无主张</p>';
+    const tempTag = ev.tempId ? '<span class="badge" style="background:#eef4fb;color:#245b96">临时编号 ' + esc(ev.tempId) + '</span>' : '';
+    return `
+      <div class="rel-line">
+        <div class="row">
+          <div style="flex:1">${tempTag}
+            <input type="text" value="${esc(ev.title)}" data-sev-title="${esc(String(ref))}" ${readOnly ? 'disabled' : ''} style="max-width:260px" />
+          </div>
+          ${readOnly ? '' : `
+            <div style="flex:0 0 auto">
+              <button class="secondary" type="button" data-se-save-event="${esc(String(ref))}" style="padding:2px 8px;font-size:12px">暂存保存</button>
+              <button class="danger" type="button" data-se-del-event="${esc(String(ref))}" style="padding:2px 8px;font-size:12px">暂存删除</button>
+            </div>`}
+        </div>
+        <textarea data-sev-desc="${esc(String(ref))}" rows="1" ${readOnly ? 'disabled' : ''}>${esc(ev.description)}</textarea>
+        <div class="muted" style="font-size:12px;margin-top:4px">时间主张（${ev.claims.length}）</div>
+        ${claims}
+        ${readOnly ? '' : `<button class="secondary" type="button" data-se-add-claim="${esc(String(ref))}" style="padding:2px 8px;font-size:12px">＋ 暂存新主张</button>`}
+      </div>`;
+  }).join('') || '<p class="muted">（工作副本无事件）</p>';
+
+  const rels = w.relations.map((r) => {
+    const ref = r.tempId || r.id;
+    const a = r.earlierTempId || r.earlierId;
+    const b = r.laterTempId || r.laterId;
+    const tag = r.tempId ? '<span class="badge" style="background:#eef4fb;color:#245b96">临时</span>' : '';
+    return `
+      <div class="rel-line">
+        ${tag}
+        <strong>${esc(sessionEventTitle(a))}</strong> <span class="badge">先于</span> <strong>${esc(sessionEventTitle(b))}</strong>
+        ${r.source ? `<div class="source"><b>出处：</b>${esc(r.source)}</div>` : ''}
+        ${readOnly ? '' : `<button class="danger" type="button" data-se-del-rel="${esc(String(ref))}" style="float:right;padding:2px 8px;font-size:12px">暂存删除</button>`}
+      </div>`;
+  }).join('') || '<p class="muted">（无先于关系）</p>';
+
+  let conflictHtml = '';
+  if (s.status === 'conflict' && s.conflicts && s.conflicts.length) {
+    conflictHtml = `
+      <div class="alert error" style="margin-top:10px">
+        <b>三方合并发现 ${s.conflicts.length} 处冲突，整次提交已被拒绝，草稿未做任何改动。</b>
+        请关闭本会话、基于最新草稿<b>重开编辑会话</b>后人工重编。逐项对照如下：
+        <ul class="error-list">
+          ${s.conflicts.map((x) => `
+            <li>
+              <b>[${esc(x.type)}]</b> ${esc(x.message)}
+              <div class="muted" style="font-family:monospace;white-space:pre-wrap">
+基线值 baseline：${esc(JSON.stringify(x.baseline))}
+当前值 current ：${esc(JSON.stringify(x.current))}
+拟提交 proposed：${esc(JSON.stringify(x.proposed))}
+              </div>
+            </li>`).join('')}
+        </ul>
+      </div>`;
+  }
+  let resultHtml = '';
+  if (s.status === 'committed' && s.result) {
+    const m = s.result.idMap;
+    resultHtml = `
+      <div class="alert ok" style="margin-top:10px">
+        <b>提交成功（原子应用全部变更）。</b>新草稿修订号 <b>${s.result.revisionNo}</b>${s.result.merged ? '（已与他人改动自动合并）' : ''}。<br>
+        临时编号 → 正式编号映射：
+        <div style="font-family:monospace;font-size:12px">
+          事件：${m.events.map((x) => `${esc(x.tempId)}→#${x.eventId}`).join('，') || '（无）'}<br>
+          主张：${m.claims.map((x) => `${esc(x.tempId)}→#${x.claimId}`).join('，') || '（无）'}<br>
+          关系：${m.relations.map((x) => `${esc(x.tempId)}→#${x.relationId}`).join('，') || '（无）'}
+        </div>
+      </div>`;
+  }
+
+  document.querySelector('#sessionBody').innerHTML = `
+    <p class="muted">
+      会话基线：草稿修订号 <b>${s.baselineRevisionNo}</b> · 当前草稿修订号 <b>${s.currentRevisionNo}</b>
+      ${s.stale ? '（<b style="color:#a15c00">期间草稿被他人修改过，提交时将三方合并</b>）' : '（草稿未变化）'}
+      · 编辑者：${esc(s.editor || '匿名')}
+    </p>
+    ${resultHtml}${conflictHtml}
+    <h3 style="font-size:14px">工作副本：事件与主张（基线 + 本会话暂存，只读基线不会被改）</h3>
+    <div style="max-height:300px;overflow:auto">${eventCards}</div>
+    ${readOnly ? '' : '<button class="secondary" type="button" id="btnSeAddEvent" style="margin-top:6px">＋ 暂存新事件</button>'}
+    <h3 style="font-size:14px;margin-top:10px">工作副本：「先于」关系</h3>
+    <div style="max-height:160px;overflow:auto">${rels}</div>
+    ${readOnly ? '' : '<button class="secondary" type="button" id="btnSeAddRel" style="margin-top:6px">＋ 暂存新先于关系</button>'}
+    <div id="sessionMsg" style="margin-top:8px"></div>`;
+}
+
+async function commitSessionFromUi() {
+  if (!openSessionData) return;
+  const btn = document.querySelector('#sessionCommit');
+  btn.disabled = true;
+  try {
+    if (!sessionCommitKey) sessionCommitKey = (crypto.randomUUID ? crypto.randomUUID() : `c-${Date.now()}-${Math.random()}`);
+    const data = await api('POST', `/api/editor/sessions/${openSessionData.sessionNo}/commit`, { commitKey: sessionCommitKey });
+    const m = data.idMap;
+    showGlobal('ok', `
+      会话 #${data.sessionNo} 提交成功：新草稿修订号 <b>${data.revisionNo}</b>${data.merged ? '（与他人改动自动合并）' : ''}。
+      原子应用全部变更，未覆盖另一人改动。
+      <span class="muted">映射：事件 ${m.events.length} 项、主张 ${m.claims.length} 项、关系 ${m.relations.length} 项。</span>`);
+    openSessionData = (await api('GET', `/api/editor/sessions/${data.sessionNo}`)).session;
+    renderSessionDialog();
+    await loadState();
+    await loadSessions();
+  } catch (err) {
+    if (err.message === 'unauthorized') return;
+    if (err.status === 409 && err.body && Array.isArray(err.body.conflicts)) {
+      // 整次拒绝：刷新会话详情，逐项展示 baseline/current/proposed
+      openSessionData = (await api('GET', `/api/editor/sessions/${openSessionData.sessionNo}`)).session;
+      renderSessionDialog();
+      showSessionMsg('error',
+        `<b>合并冲突（${err.body.conflicts.length} 处），整次提交已拒绝，草稿未改动。</b>
+         <span class="muted">请关闭后基于最新草稿重开会话。重试同一提交不会重复写入。</span>`);
+      await loadSessions();
+    } else {
+      showSessionMsg('error', esc(err.message));
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function abandonSessionFromUi() {
+  if (!openSessionData) return;
+  if (!confirm('放弃本会话？暂存修改将保留在库中但不再可提交（可随时查看）。')) return;
+  try {
+    await api('DELETE', `/api/editor/sessions/${openSessionData.sessionNo}`);
+    document.querySelector('#sessionDialog').close();
+    showGlobal('ok', `会话 #${openSessionData.sessionNo} 已放弃（草稿未改动）。`);
+    openSessionData = null;
+    await loadSessions();
+  } catch (err) {
+    if (err.message !== 'unauthorized') showSessionMsg('error', esc(err.message));
+  }
+}
+
 // ---------- 启动 ----------
 document.addEventListener('click', (e) => {
+  // 会话相关按钮（动态渲染于会话对话框 / 会话卡片）
+  const st = e.target;
+  if (st instanceof HTMLElement) {
+    if (st.id === 'btnSessionNew') return createSessionFromUi();
+    if (st.id === 'btnSessionRefresh') return loadSessions();
+    const openNo = st.dataset && st.dataset.openSession;
+    if (openNo !== undefined) return openSessionDialog(Number(openNo));
+    if (st.id === 'sessionCommit') return commitSessionFromUi();
+    if (st.id === 'sessionAbandon') return abandonSessionFromUi();
+    if (st.id === 'sessionClose') { document.querySelector('#sessionDialog').close(); return; }
+    if (st.id === 'btnSeAddEvent') return sessionAddEvent();
+    if (st.id === 'btnSeAddRel') return sessionAddRelation();
+    const ds = st.dataset || {};
+    if (ds.seSaveEvent !== undefined) return sessionSaveEventField(ds.seSaveEvent === String(Number(ds.seSaveEvent)) ? Number(ds.seSaveEvent) : ds.seSaveEvent);
+    if (ds.seDelEvent !== undefined) return sessionDeleteEvent(Number.isFinite(Number(ds.seDelEvent)) && String(Number(ds.seDelEvent)) === ds.seDelEvent ? Number(ds.seDelEvent) : ds.seDelEvent);
+    if (ds.seAddClaim !== undefined) return sessionAddClaim(Number.isFinite(Number(ds.seAddClaim)) && String(Number(ds.seAddClaim)) === ds.seAddClaim ? Number(ds.seAddClaim) : ds.seAddClaim);
+    if (ds.seEditClaim !== undefined) return sessionEditClaim(Number.isFinite(Number(ds.seEditClaim)) && String(Number(ds.seEditClaim)) === ds.seEditClaim ? Number(ds.seEditClaim) : ds.seEditClaim);
+    if (ds.seDelClaim !== undefined) return sessionDeleteClaim(Number.isFinite(Number(ds.seDelClaim)) && String(Number(ds.seDelClaim)) === ds.seDelClaim ? Number(ds.seDelClaim) : ds.seDelClaim);
+    if (ds.seDelRel !== undefined) return sessionDeleteRelation(Number.isFinite(Number(ds.seDelRel)) && String(Number(ds.seDelRel)) === ds.seDelRel ? Number(ds.seDelRel) : ds.seDelRel);
+  }
+
   onClick(e).catch((err) => {
     if (err.message !== 'unauthorized') showGlobal('error', esc(err.message));
   });
